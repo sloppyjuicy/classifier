@@ -1,135 +1,541 @@
+# rbs_inline: enabled
+
 # Author::    Lucas Carlson  (mailto:lucas@rufy.com)
 # Copyright:: Copyright (c) 2005 Lucas Carlson
 # License::   LGPL
 
+require 'json'
+require 'mutex_m'
+
 module Classifier
+  class Bayes # rubocop:disable Metrics/ClassLength
+    include Mutex_m
+    include Streaming
 
-class Bayes
-  # The class can be created with one or more categories, each of which will be
-  # initialized and given a training method. E.g.,
-  #      b = Classifier::Bayes.new 'Interesting', 'Uninteresting', 'Spam'
-	def initialize(*categories)
-		@categories = Hash.new
-		categories.each { |category| @categories[category.prepare_category_name] = Hash.new }
-		@total_words = 0
-                @category_counts = Hash.new(0)
-	end
+    # @rbs @categories: Hash[Symbol, Hash[Symbol, Integer]]
+    # @rbs @total_words: Integer
+    # @rbs @category_counts: Hash[Symbol, Integer]
+    # @rbs @category_word_count: Hash[Symbol, Integer]
+    # @rbs @cached_training_count: Float?
+    # @rbs @cached_vocab_size: Integer?
+    # @rbs @dirty: bool
+    # @rbs @storage: Storage::Base?
+    # @rbs @min_word_length: Integer
 
-	#
-	# Provides a general training method for all categories specified in Bayes#new
-	# For example:
-	#     b = Classifier::Bayes.new 'This', 'That', 'the_other'
-	#     b.train :this, "This text"
-	#     b.train "that", "That text"
-	#     b.train "The other", "The other text"
-	def train(category, text)
-		category = category.prepare_category_name
-                @category_counts[category] += 1
-		text.word_hash.each do |word, count|
-			@categories[category][word]     ||=     0
-			@categories[category][word]      +=     count
-			@total_words += count
-		end
-	end
+    attr_accessor :storage
 
-	#
-	# Provides a untraining method for all categories specified in Bayes#new
-	# Be very careful with this method.
-	#
-	# For example:
-	#     b = Classifier::Bayes.new 'This', 'That', 'the_other'
-	#     b.train :this, "This text"
-	#     b.untrain :this, "This text"
-	def untrain(category, text)
-		category = category.prepare_category_name
-                @category_counts[category] -= 1
-		text.word_hash.each do |word, count|
-			if @total_words >= 0
-				orig = @categories[category][word]
-				@categories[category][word]     ||=     0
-				@categories[category][word]      -=     count
-				if @categories[category][word] <= 0
-					@categories[category].delete(word)
-					count = orig
-				end
-				@total_words -= count
-			end
-		end
-	end
+    # The class can be created with one or more categories, each of which will be
+    # initialized and given a training method. E.g.,
+    #      b = Classifier::Bayes.new 'Interesting', 'Uninteresting', 'Spam'
+    #      b = Classifier::Bayes.new ['Interesting', 'Uninteresting', 'Spam']
+    #      b = Classifier::Bayes.new 'Spam', min_word_length: 1
+    # @rbs (*String | Symbol | Array[String | Symbol], ?min_word_length: Integer) -> void
+    def initialize(*categories, min_word_length: Classifier.config.min_word_length)
+      super()
+      @categories = {}
+      categories.flatten.each { |category| @categories[category.prepare_category_name] = {} }
+      @total_words = 0
+      @category_counts = Hash.new(0)
+      @category_word_count = Hash.new(0)
+      @cached_training_count = nil
+      @cached_vocab_size = nil
+      @dirty = false
+      @storage = nil
+      @min_word_length = min_word_length
+    end
 
-	#
-	# Returns the scores in each category the provided +text+. E.g.,
-	#    b.classifications "I hate bad words and you"
-	#    =>  {"Uninteresting"=>-12.6997928013932, "Interesting"=>-18.4206807439524}
-	# The largest of these scores (the one closest to 0) is the one picked out by #classify
-	def classifications(text)
-		score = Hash.new
-                training_count = @category_counts.values.inject { |x,y| x+y }.to_f
-		@categories.each do |category, category_words|
-			score[category.to_s] = 0
-			total = category_words.values.inject(0) {|sum, element| sum+element}
-			text.word_hash.each do |word, count|
-				s = category_words.has_key?(word) ? category_words[word] : 0.1
-				score[category.to_s] += Math.log(s/total.to_f)
-			end
-                        # now add prior probability for the category
-                        s = @category_counts.has_key?(category) ? @category_counts[category] : 0.1
-                        score[category.to_s] += Math.log(s / training_count)
-		end
-		return score
-	end
+    # Trains the classifier with text for a category.
+    #
+    #     b.train(spam: "Buy now!", ham: ["Hello", "Meeting tomorrow"])
+    #     b.train(:spam, "legacy positional API")
+    #
+    # @rbs (?(String | Symbol)?, ?String?, **(String | Array[String])) -> void
+    def train(category = nil, text = nil, **categories)
+      return train_single(category, text) if category && text
 
-  #
-  # Returns the classification of the provided +text+, which is one of the
-  # categories given in the initializer. E.g.,
-  #    b.classify "I hate bad words and you"
-  #    =>  'Uninteresting'
-	def classify(text)
-		(classifications(text).sort_by { |a| -a[1] })[0][0]
-	end
+      categories.each do |cat, texts|
+        (texts.is_a?(Array) ? texts : [texts]).each { |t| train_single(cat, t) }
+      end
+    end
 
-	#
-	# Provides training and untraining methods for the categories specified in Bayes#new
-	# For example:
-	#     b = Classifier::Bayes.new 'This', 'That', 'the_other'
-	#     b.train_this "This text"
-	#     b.train_that "That text"
-	#     b.untrain_that "That text"
-	#     b.train_the_other "The other text"
-	def method_missing(name, *args)
-		category = name.to_s.gsub(/(un)?train_([\w]+)/, '\2').prepare_category_name
-		if @categories.has_key? category
-			args.each { |text| eval("#{$1}train(category, text)") }
-		elsif name.to_s =~ /(un)?train_([\w]+)/
-			raise StandardError, "No such category: #{category}"
-		else
-	    super  #raise StandardError, "No such method: #{name}"
-		end
-	end
+    # Removes training data. Be careful with this method.
+    #
+    #     b.untrain(spam: "Buy now!")
+    #     b.untrain(:spam, "legacy positional API")
+    #
+    # @rbs (?(String | Symbol)?, ?String?, **(String | Array[String])) -> void
+    def untrain(category = nil, text = nil, **categories)
+      return untrain_single(category, text) if category && text
 
-	#
-	# Provides a list of category names
-	# For example:
-	#     b.categories
-	#     =>   ['This', 'That', 'the_other']
-	def categories # :nodoc:
-		@categories.keys.collect {|c| c.to_s}
-	end
+      categories.each do |cat, texts|
+        (texts.is_a?(Array) ? texts : [texts]).each { |t| untrain_single(cat, t) }
+      end
+    end
 
-	#
-	# Allows you to add categories to the classifier.
-	# For example:
-	#     b.add_category "Not spam"
-	#
-	# WARNING: Adding categories to a trained classifier will
-	# result in an undertrained category that will tend to match
-	# more criteria than the trained selective categories. In short,
-	# try to initialize your categories at initialization.
-	def add_category(category)
-		@categories[category.prepare_category_name] = Hash.new
-	end
+    # Returns the scores in each category the provided +text+. E.g.,
+    #    b.classifications "I hate bad words and you"
+    #    =>  {"Uninteresting"=>-12.6997928013932, "Interesting"=>-18.4206807439524}
+    # The largest of these scores (the one closest to 0) is the one picked out by #classify
+    #
+    # @rbs (String) -> Hash[String, Float]
+    def classifications(text)
+      words = text.word_hash(@min_word_length).keys
+      synchronize do
+        training_count = cached_training_count
+        vocab_size = cached_vocab_size
 
-	alias append_category add_category
-end
+        @categories.to_h do |category, category_words|
+          smoothed_total = ((@category_word_count[category] || 0) + vocab_size).to_f
 
+          # Laplace smoothing: P(word|category) = (count + α) / (total + α * V)
+          word_score = words.sum { |w| Math.log(((category_words[w] || 0) + 1) / smoothed_total) }
+          prior_score = Math.log((@category_counts[category] || 0.1) / training_count)
+
+          [category.to_s, word_score + prior_score]
+        end
+      end
+    end
+
+    # Returns the classification of the provided +text+, which is one of the
+    # categories given in the initializer. E.g.,
+    #    b.classify "I hate bad words and you"
+    #    =>  'Uninteresting'
+    #
+    # @rbs (String) -> String
+    def classify(text)
+      best = classifications(text).min_by { |a| -a[1] }
+      raise StandardError, 'No classifications available' unless best
+
+      best.first.to_s
+    end
+
+    # Returns a hash representation of the classifier state.
+    # This can be converted to JSON or used directly.
+    #
+    # @rbs (?untyped) -> untyped
+    def as_json(_options = nil)
+      {
+        version: 1,
+        type: 'bayes',
+        categories: @categories.transform_keys(&:to_s).transform_values { |v| v.transform_keys(&:to_s) },
+        total_words: @total_words,
+        category_counts: @category_counts.transform_keys(&:to_s),
+        category_word_count: @category_word_count.transform_keys(&:to_s),
+        min_word_length: @min_word_length
+      }
+    end
+
+    # Serializes the classifier state to a JSON string.
+    # This can be saved to a file and later loaded with Bayes.from_json.
+    #
+    # @rbs (?untyped) -> String
+    def to_json(_options = nil)
+      as_json.to_json
+    end
+
+    # Loads a classifier from a JSON string or a Hash created by #to_json or #as_json.
+    #
+    # @rbs (String | Hash[String, untyped]) -> Bayes
+    def self.from_json(json)
+      data = json.is_a?(String) ? JSON.parse(json) : json
+      raise ArgumentError, "Invalid classifier type: #{data['type']}" unless data['type'] == 'bayes'
+
+      instance = allocate
+      instance.send(:restore_state, data)
+      instance
+    end
+
+    # Saves the classifier to the configured storage.
+    # Raises ArgumentError if no storage is configured.
+    #
+    # @rbs () -> void
+    def save
+      raise ArgumentError, 'No storage configured. Use save_to_file(path) or set storage=' unless storage
+
+      storage.write(to_json)
+      @dirty = false
+    end
+
+    # Saves the classifier state to a file (legacy API).
+    #
+    # @rbs (String) -> Integer
+    def save_to_file(path)
+      result = File.write(path, to_json)
+      @dirty = false
+      result
+    end
+
+    # Reloads the classifier from the configured storage.
+    # Raises UnsavedChangesError if there are unsaved changes.
+    # Use reload! to force reload and discard changes.
+    #
+    # @rbs () -> self
+    def reload
+      raise ArgumentError, 'No storage configured' unless storage
+      raise UnsavedChangesError, 'Unsaved changes would be lost. Call save first or use reload!' if @dirty
+
+      data = storage.read
+      raise StorageError, 'No saved state found' unless data
+
+      restore_from_json(data)
+      @dirty = false
+      self
+    end
+
+    # Force reloads the classifier from storage, discarding any unsaved changes.
+    #
+    # @rbs () -> self
+    def reload!
+      raise ArgumentError, 'No storage configured' unless storage
+
+      data = storage.read
+      raise StorageError, 'No saved state found' unless data
+
+      restore_from_json(data)
+      @dirty = false
+      self
+    end
+
+    # Returns true if there are unsaved changes.
+    #
+    # @rbs () -> bool
+    def dirty?
+      @dirty
+    end
+
+    # Loads a classifier from the configured storage.
+    # The storage is set on the returned instance.
+    #
+    # @rbs (storage: Storage::Base) -> Bayes
+    def self.load(storage:)
+      data = storage.read
+      raise StorageError, 'No saved state found' unless data
+
+      instance = from_json(data)
+      instance.storage = storage
+      instance
+    end
+
+    # Loads a classifier from a file (legacy API).
+    #
+    # @rbs (String) -> Bayes
+    def self.load_from_file(path)
+      from_json(File.read(path))
+    end
+
+    #
+    # Provides training and untraining methods for the categories specified in Bayes#new
+    # For example:
+    #     b = Classifier::Bayes.new 'This', 'That', 'the_other'
+    #     b.train_this "This text"
+    #     b.train_that "That text"
+    #     b.untrain_that "That text"
+    #     b.train_the_other "The other text"
+    def method_missing(name, *args)
+      return super unless name.to_s =~ /(un)?train_(\w+)/
+
+      category = name.to_s.gsub(/(un)?train_(\w+)/, '\2').prepare_category_name
+      raise StandardError, "No such category: #{category}" unless @categories.key?(category)
+
+      method = name.to_s.start_with?('untrain_') ? :untrain : :train
+      args.each { |text| send(method, category, text) }
+    end
+
+    # @rbs (Symbol, ?bool) -> bool
+    def respond_to_missing?(name, include_private = false)
+      !!(name.to_s =~ /(un)?train_(\w+)/) || super
+    end
+
+    # Provides a list of category names
+    # For example:
+    #     b.categories
+    #     =>   ['This', 'That', 'the_other']
+    #
+    # @rbs () -> Array[String]
+    def categories
+      synchronize { @categories.keys.collect(&:to_s) }
+    end
+
+    # Allows you to add categories to the classifier.
+    # For example:
+    #     b.add_category "Not spam"
+    #
+    # WARNING: Adding categories to a trained classifier will
+    # result in an undertrained category that will tend to match
+    # more criteria than the trained selective categories. In short,
+    # try to initialize your categories at initialization.
+    #
+    # @rbs (String | Symbol) -> Hash[Symbol, Integer]
+    def add_category(category)
+      synchronize do
+        invalidate_caches
+        @dirty = true
+        @categories[category.prepare_category_name] = {}
+      end
+    end
+
+    alias append_category add_category
+
+    # Custom marshal serialization to exclude mutex state
+    # @rbs () -> Array[untyped]
+    def marshal_dump
+      [@categories, @total_words, @category_counts, @category_word_count, @dirty,
+       @min_word_length]
+    end
+
+    # Custom marshal deserialization to recreate mutex
+    # @rbs (Array[untyped]) -> void
+    def marshal_load(data)
+      mu_initialize
+      @categories, @total_words, @category_counts, @category_word_count, @dirty,
+        @min_word_length = data
+      @min_word_length ||= Classifier.config.min_word_length
+      @cached_training_count = nil
+      @cached_vocab_size = nil
+      @storage = nil
+    end
+
+    # Allows you to remove categories from the classifier.
+    # For example:
+    #     b.remove_category "Spam"
+    #
+    # WARNING: Removing categories from a trained classifier will
+    # result in the loss of all training data for that category.
+    # Make sure you really want to do this before calling this method.
+    #
+    # @rbs (String | Symbol) -> void
+    def remove_category(category)
+      category = category.prepare_category_name
+      synchronize do
+        raise StandardError, "No such category: #{category}" unless @categories.key?(category)
+
+        invalidate_caches
+        @dirty = true
+        @total_words -= @category_word_count[category].to_i
+
+        @categories.delete(category)
+        @category_counts.delete(category)
+        @category_word_count.delete(category)
+      end
+    end
+
+    # Trains the classifier from an IO stream.
+    # Each line in the stream is treated as a separate document.
+    # This is memory-efficient for large corpora.
+    #
+    # @example Train from a file
+    #   classifier.train_from_stream(:spam, File.open('spam_corpus.txt'))
+    #
+    # @example With progress tracking
+    #   classifier.train_from_stream(:spam, io, batch_size: 500) do |progress|
+    #     puts "#{progress.completed} documents processed"
+    #   end
+    #
+    # @rbs (?(String | Symbol | nil), ?IO?, ?batch_size: Integer, **IO) { (Streaming::Progress) -> void } -> void
+    def train_from_stream(category = nil, io = nil, batch_size: Streaming::DEFAULT_BATCH_SIZE, **categories, &)
+      raise ArgumentError, 'Provide either (category, io) or keyword category: io pairs' if category.nil? && io.nil? && categories.empty?
+      raise ArgumentError, 'Provide both category and io, or use keyword arguments' if [category, io].one?(&:nil?)
+
+      pairs = category && io ? { category => io } : categories
+      pairs.each do |cat, stream|
+        stream_train_category(cat, stream, batch_size: batch_size, &)
+      end
+    end
+
+    # Trains the classifier with an array of documents in batches.
+    # Reduces lock contention by processing multiple documents per synchronize call.
+    #
+    # @example Positional style
+    #   classifier.train_batch(:spam, documents, batch_size: 100)
+    #
+    # @example Keyword style
+    #   classifier.train_batch(spam: documents, ham: other_docs, batch_size: 100)
+    #
+    # @example With progress tracking
+    #   classifier.train_batch(:spam, documents, batch_size: 100) do |progress|
+    #     puts "#{progress.percent}% complete"
+    #   end
+    #
+    # @rbs (?(String | Symbol)?, ?Array[String]?, ?batch_size: Integer, **Array[String]) { (Streaming::Progress) -> void } -> void
+    def train_batch(category = nil, documents = nil, batch_size: Streaming::DEFAULT_BATCH_SIZE, **categories, &block)
+      if category && documents
+        train_batch_for_category(category, documents, batch_size: batch_size, &block)
+      else
+        categories.each do |cat, docs|
+          train_batch_for_category(cat, Array(docs), batch_size: batch_size, &block)
+        end
+      end
+    end
+
+    # Loads a classifier from a checkpoint.
+    #
+    # @rbs (storage: Storage::Base, checkpoint_id: String) -> Bayes
+    def self.load_checkpoint(storage:, checkpoint_id:)
+      raise ArgumentError, 'Storage must be File storage for checkpoints' unless storage.is_a?(Storage::File)
+
+      dir = File.dirname(storage.path)
+      base = File.basename(storage.path, '.*')
+      ext = File.extname(storage.path)
+      checkpoint_path = File.join(dir, "#{base}_checkpoint_#{checkpoint_id}#{ext}")
+
+      checkpoint_storage = Storage::File.new(path: checkpoint_path)
+      instance = load(storage: checkpoint_storage)
+      instance.storage = storage
+      instance
+    end
+
+    private
+
+    # Trains from an IO stream with a single category.
+    # @rbs (String | Symbol, IO, batch_size: Integer) { (Streaming::Progress) -> void } -> void
+    def stream_train_category(category, io, batch_size:)
+      category = category.prepare_category_name
+      raise ArgumentError, "No such category: #{category}" unless @categories.key?(category)
+      raise ArgumentError, 'Stream must respond to #each_line' unless io.respond_to?(:each_line)
+
+      reader = Streaming::LineReader.new(io, batch_size: batch_size)
+      total = reader.estimate_line_count
+      progress = Streaming::Progress.new(total: total)
+
+      reader.each_batch do |batch|
+        train_batch_internal(category, batch)
+        progress.completed += batch.size
+        progress.current_batch += 1
+        yield progress if block_given?
+      end
+    end
+
+    # Trains a batch of documents for a single category.
+    # @rbs (String | Symbol, Array[String], ?batch_size: Integer) { (Streaming::Progress) -> void } -> void
+    def train_batch_for_category(category, documents, batch_size: Streaming::DEFAULT_BATCH_SIZE)
+      category = category.prepare_category_name
+      raise StandardError, "No such category: #{category}" unless @categories.key?(category)
+
+      progress = Streaming::Progress.new(total: documents.size)
+
+      documents.each_slice(batch_size) do |batch|
+        train_batch_internal(category, batch)
+        progress.completed += batch.size
+        progress.current_batch += 1
+        yield progress if block_given?
+      end
+    end
+
+    # Internal method to train a batch of documents.
+    # Uses a single synchronize block for the entire batch.
+    # @rbs (Symbol, Array[String]) -> void
+    def train_batch_internal(category, batch)
+      synchronize do
+        invalidate_caches
+        @dirty = true
+        batch.each do |text|
+          word_hash = text.word_hash(@min_word_length)
+          @category_counts[category] += 1
+          word_hash.each do |word, count|
+            @categories[category][word] ||= 0
+            @categories[category][word] += count
+            @total_words += count
+            @category_word_count[category] += count
+          end
+        end
+      end
+    end
+
+    # Core training logic for a single category and text.
+    # @rbs (String | Symbol, String) -> void
+    def train_single(category, text)
+      category = category.prepare_category_name
+      word_hash = text.word_hash(@min_word_length)
+      synchronize do
+        invalidate_caches
+        @dirty = true
+        @category_counts[category] += 1
+        word_hash.each do |word, count|
+          @categories[category][word] ||= 0
+          @categories[category][word] += count
+          @total_words += count
+          @category_word_count[category] += count
+        end
+      end
+    end
+
+    # Core untraining logic for a single category and text.
+    # @rbs (String | Symbol, String) -> void
+    def untrain_single(category, text)
+      category = category.prepare_category_name
+      word_hash = text.word_hash(@min_word_length)
+      synchronize do
+        invalidate_caches
+        @dirty = true
+        @category_counts[category] -= 1
+        word_hash.each do |word, count|
+          next unless @total_words >= 0
+
+          orig = @categories[category][word] || 0
+          @categories[category][word] ||= 0
+          @categories[category][word] -= count
+          if @categories[category][word] <= 0
+            @categories[category].delete(word)
+            count = orig
+          end
+          @category_word_count[category] -= count if @category_word_count[category] >= count
+          @total_words -= count
+        end
+      end
+    end
+
+    # Restores classifier state from a JSON string (used by reload)
+    # @rbs (String) -> void
+    def restore_from_json(json)
+      data = JSON.parse(json)
+      raise ArgumentError, "Invalid classifier type: #{data['type']}" unless data['type'] == 'bayes'
+
+      synchronize do
+        restore_state(data)
+      end
+    end
+
+    # Restores classifier state from a hash (used by from_json)
+    # @rbs (Hash[String, untyped]) -> void
+    def restore_state(data)
+      mu_initialize
+      @categories = {} #: Hash[Symbol, Hash[Symbol, Integer]]
+      @total_words = data['total_words']
+      @category_counts = Hash.new(0) #: Hash[Symbol, Integer]
+      @category_word_count = Hash.new(0) #: Hash[Symbol, Integer]
+      @cached_training_count = nil
+      @cached_vocab_size = nil
+      @dirty = false
+      @storage = nil
+      @min_word_length = data['min_word_length'] || Classifier.config.min_word_length
+
+      data['categories'].each do |cat_name, words|
+        @categories[cat_name.to_sym] = words.transform_keys(&:to_sym)
+      end
+
+      data['category_counts'].each do |cat_name, count|
+        @category_counts[cat_name.to_sym] = count
+      end
+
+      data['category_word_count'].each do |cat_name, count|
+        @category_word_count[cat_name.to_sym] = count
+      end
+    end
+
+    # @rbs () -> void
+    def invalidate_caches
+      @cached_training_count = nil
+      @cached_vocab_size = nil
+    end
+
+    # @rbs () -> Float
+    def cached_training_count
+      @cached_training_count ||= @category_counts.values.sum.to_f
+    end
+
+    # @rbs () -> Integer
+    def cached_vocab_size
+      @cached_vocab_size ||= [@categories.values.flat_map(&:keys).uniq.size, 1].max
+    end
+  end
 end

@@ -1,136 +1,159 @@
+# rbs_inline: enabled
+
 # Author::    Lucas Carlson  (mailto:lucas@rufy.com)
 # Copyright:: Copyright (c) 2005 Lucas Carlson
 # License::   LGPL
 
-require "set"
+require 'set'
 
 # These are extensions to the String class to provide convenience
 # methods for the Classifier package.
 class String
-
   # Removes common punctuation symbols, returning a new string.
   # E.g.,
   #   "Hello (greeting's), with {braces} < >...?".without_punctuation
   #   => "Hello  greetings   with  braces         "
+  # @rbs () -> String
   def without_punctuation
-    tr( ',?.!;:"@#$%^&*()_=+[]{}\|<>/`~', " " ) .tr( "'\-", "")
+    tr(',?.!;:"@#$%^&*()_=+[]{}|<>/`~', ' ').tr("'-", '')
   end
 
   # Return a Hash of strings => ints. Each word in the string is stemmed,
   # interned, and indexes to its frequency in the document.
-	def word_hash
-		word_hash = clean_word_hash()
-		symbol_hash = word_hash_for_symbols(gsub(/[\w]/," ").split)
-		return word_hash.merge(symbol_hash)
-	end
+  # @rbs (?Integer) -> Hash[Symbol, Integer]
+  def word_hash(min_word_length = 3)
+    word_hash = clean_word_hash(min_word_length)
+    symbol_hash = word_hash_for_symbols(gsub(/\w/, ' ').split)
+    word_hash.merge(symbol_hash)
+  end
 
-	# Return a word hash without extra punctuation or short symbols, just stemmed words
-	def clean_word_hash
-		word_hash_for_words gsub(/[^\w\s]/,"").split
-	end
+  # Return a word hash without extra punctuation or short symbols, just stemmed words
+  # @rbs (?Integer) -> Hash[Symbol, Integer]
+  def clean_word_hash(min_word_length = 3)
+    word_hash_for_words(gsub(/[^\w\s]/, '').split, min_word_length)
+  end
 
-	private
+  # Builds a mapping between stemmed roots and their most frequent original words.
+  # @rbs (?Integer) -> Hash[Symbol, String]
+  def stem_to_word_hash(min_word_length = 3)
+    mapping_stem_to_word_for_words(gsub(/[^\w\s]/, '').split, min_word_length)
+  end
 
-	def word_hash_for_words(words)
-		d = Hash.new(0)
-		words.each do |word|
-			word.downcase!
-			if ! CORPUS_SKIP_WORDS.include?(word) && word.length > 2
-				d[word.stem.intern] += 1
-			end
-		end
-		return d
-	end
+  private
 
+  # @rbs (Array[String], Integer) -> Hash[Symbol, Integer]
+  def word_hash_for_words(words, min_word_length)
+    d = Hash.new(0)
+    words.each do |word|
+      word.downcase!
+      d[word.stem.intern] += 1 if !CORPUS_SKIP_WORDS.include?(word) && word.length >= min_word_length
+    end
+    d
+  end
 
-	def word_hash_for_symbols(words)
-		d = Hash.new(0)
-		words.each do |word|
-			d[word.intern] += 1
-		end
-		return d
-	end
+  # @rbs (Array[String]) -> Hash[Symbol, Integer]
+  def word_hash_for_symbols(words)
+    d = Hash.new(0)
+    words.each do |word|
+      d[word.intern] += 1
+    end
+    d
+  end
 
-	CORPUS_SKIP_WORDS = Set.new([
-      "a",
-      "again",
-      "all",
-      "along",
-      "are",
-      "also",
-      "an",
-      "and",
-      "as",
-      "at",
-      "but",
-      "by",
-      "came",
-      "can",
-      "cant",
-      "couldnt",
-      "did",
-      "didn",
-      "didnt",
-      "do",
-      "doesnt",
-      "dont",
-      "ever",
-      "first",
-      "from",
-      "have",
-      "her",
-      "here",
-      "him",
-      "how",
-      "i",
-      "if",
-      "in",
-      "into",
-      "is",
-      "isnt",
-      "it",
-      "itll",
-      "just",
-      "last",
-      "least",
-      "like",
-      "most",
-      "my",
-      "new",
-      "no",
-      "not",
-      "now",
-      "of",
-      "on",
-      "or",
-      "should",
-      "sinc",
-      "so",
-      "some",
-      "th",
-      "than",
-      "this",
-      "that",
-      "the",
-      "their",
-      "then",
-      "those",
-      "to",
-      "told",
-      "too",
-      "true",
-      "try",
-      "until",
-      "url",
-      "us",
-      "were",
-      "when",
-      "whether",
-      "while",
-      "with",
-      "within",
-      "yes",
-      "you",
-      "youll",
-      ])
+  # @rbs (Array[String], Integer) -> Hash[Symbol, Integer]
+  def mapping_stem_to_word_for_words(words, min_word_length)
+    h = {}
+    words.map { _1.tap(&:downcase!) }.tally.each do |word, count|
+      next unless !CORPUS_SKIP_WORDS.include?(word) && word.length >= min_word_length
+
+      stem = word.stem.intern
+      h[stem] ||= [word, count]
+      h[stem] = [word, count] if h.dig(stem, 1) < count
+    end
+    h.each_key { |k| h[k] = h[k].first }
+    h
+  end
+
+  CORPUS_SKIP_WORDS = ::Set.new(%w[
+                                  a
+                                  again
+                                  all
+                                  along
+                                  are
+                                  also
+                                  an
+                                  and
+                                  as
+                                  at
+                                  but
+                                  by
+                                  came
+                                  can
+                                  cant
+                                  couldnt
+                                  did
+                                  didn
+                                  didnt
+                                  do
+                                  doesnt
+                                  dont
+                                  ever
+                                  first
+                                  from
+                                  have
+                                  her
+                                  here
+                                  him
+                                  how
+                                  i
+                                  if
+                                  in
+                                  into
+                                  is
+                                  isnt
+                                  it
+                                  itll
+                                  just
+                                  last
+                                  least
+                                  like
+                                  most
+                                  my
+                                  new
+                                  no
+                                  not
+                                  now
+                                  of
+                                  on
+                                  or
+                                  should
+                                  sinc
+                                  so
+                                  some
+                                  th
+                                  than
+                                  this
+                                  that
+                                  the
+                                  their
+                                  then
+                                  those
+                                  to
+                                  told
+                                  too
+                                  true
+                                  try
+                                  until
+                                  url
+                                  us
+                                  were
+                                  when
+                                  whether
+                                  while
+                                  with
+                                  within
+                                  yes
+                                  you
+                                  youll
+                                ])
 end

@@ -25,6 +25,15 @@
 # License::   LGPL
 
 require 'rubygems'
+require 'classifier/version'
+require 'classifier/errors'
+require 'classifier/storage'
+require 'classifier/streaming'
 require 'classifier/extensions/string'
+require 'classifier/extensions/vector'
 require 'classifier/bayes'
 require 'classifier/lsi'
+require 'classifier/knn'
+require 'classifier/tfidf'
+require 'classifier/logistic_regression'
+require 'classifier/config'

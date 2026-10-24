@@ -1,0 +1,37 @@
+# Type stubs for matrix gem
+# Using untyped elements since our usage is primarily with Floats/Numerics
+class Vector
+  EPSILON: Float
+
+  def self.[]: (*untyped) -> Vector
+  def size: () -> Integer
+  def []: (Integer) -> untyped
+  def magnitude: () -> Float
+  def normalize: () -> Vector
+  def each: () { (untyped) -> void } -> void
+  def collect: () { (untyped) -> untyped } -> Vector
+  def to_a: () -> Array[untyped]
+  def *: (untyped) -> untyped
+  def -: (Vector) -> Vector
+  def is_a?: (untyped) -> bool
+end
+
+class Matrix
+  def self.rows: (Array[Array[untyped]]) -> Matrix
+  def self.[]: (*Array[untyped]) -> Matrix
+  def self.diag: (untyped) -> Matrix
+  def self.columns: (Array[Array[untyped]]) -> Matrix
+  def self.empty: (Integer, Integer) -> Matrix
+  def self.zero: (Integer, Integer) -> Matrix
+  def self.vstack: (Matrix, Matrix) -> Matrix
+  def trans: () -> Matrix
+  def transpose: () -> Matrix
+  def *: (untyped) -> untyped
+  def row_size: () -> Integer
+  def column_size: () -> Integer
+  def row: (Integer) -> Vector
+  def column: (Integer) -> Vector
+  def SV_decomp: () -> [Matrix, Matrix, untyped]
+  def is_a?: (untyped) -> bool
+  def respond_to?: (Symbol) -> bool
+end

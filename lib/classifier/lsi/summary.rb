@@ -3,29 +3,49 @@
 # License::   LGPL
 
 class String
-   def summary( count=10, separator=" [...] " )
-      perform_lsi split_sentences, count, separator
-   end
+  ABBREVIATIONS = %w[Mr Mrs Ms Dr Prof Jr Sr Inc Ltd Corp Co vs etc al eg ie].freeze
 
-   def paragraph_summary( count=1, separator=" [...] " )
-      perform_lsi split_paragraphs, count, separator
-   end
+  def summary(count = 10, separator = ' [...] ')
+    perform_lsi split_sentences, count, separator
+  end
 
-   def split_sentences
-      split /(\.|\!|\?)/ # TODO: make this less primitive
-   end
+  def paragraph_summary(count = 1, separator = ' [...] ')
+    perform_lsi split_paragraphs, count, separator
+  end
 
-   def split_paragraphs
-      split /(\n\n|\r\r|\r\n\r\n)/ # TODO: make this less primitive
-   end
+  def split_sentences
+    return pragmatic_segment if defined?(PragmaticSegmenter)
 
-   private
+    split_sentences_regex
+  end
 
-   def perform_lsi(chunks, count, separator)
-      lsi = Classifier::LSI.new :auto_rebuild => false
-      chunks.each { |chunk| lsi << chunk unless chunk.strip.empty? || chunk.strip.split.size == 1 }
-      lsi.build_index
-      summaries = lsi.highest_relative_content count
-      return summaries.reject { |chunk| !summaries.include? chunk }.map { |x| x.strip }.join(separator)
-   end
+  def split_paragraphs
+    split(/\r?\n\r?\n+/)
+  end
+
+  private
+
+  def pragmatic_segment
+    PragmaticSegmenter::Segmenter.new(text: self).segment
+  end
+
+  def split_sentences_regex
+    abbrev_pattern = ABBREVIATIONS.map { |a| "#{a}\\." }.join('|')
+    text = gsub(/\b(#{abbrev_pattern})/i) { |m| m.gsub('.', '<<<DOT>>>') }
+    text = text.gsub(/(\d)\.(\d)/, '\1<<<DOT>>>\2')
+    sentences = text.split(/(?<=[.!?])(?:\s+|(?=[A-Z]))/)
+    sentences.map { |s| s.gsub('<<<DOT>>>', '.') }
+  end
+
+  def perform_lsi(chunks, count, separator)
+    lsi = Classifier::LSI.new auto_rebuild: false
+    chunks.each do |chunk|
+      stripped = chunk.strip
+      next if stripped.empty? || stripped.split.size == 1
+
+      lsi << chunk
+    end
+    lsi.build_index
+    lsi.highest_relative_content(count).map(&:strip).join(separator)
+  end
 end

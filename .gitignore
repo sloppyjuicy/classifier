@@ -1,0 +1,31 @@
+# Coverage reports
+coverage/
+
+# Gem build artifacts
+*.gem
+pkg/
+
+# Native extension build artifacts
+*.bundle
+*.so
+*.o
+*.gcda
+*.gcno
+tmp/
+lib/classifier/classifier_ext.*
+Makefile
+mkmf.log
+
+# IDE/editor files
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+
+# Claude Code local settings, except tracked project skills
+.claude/*
+!.claude/skills/
+sig/generated/

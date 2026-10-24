@@ -1,49 +1,204 @@
+# rbs_inline: enabled
+
 # Author::    David Fayram  (mailto:dfayram@lensmen.net)
 # Copyright:: Copyright (c) 2005 David Fayram II
 # License::   LGPL
 
+module Classifier
+  class LSI
+    # Backend options: :native, :ruby
+    # @rbs @backend: Symbol
+    @backend = :ruby
+
+    class << self
+      # @rbs @backend: Symbol
+      attr_accessor :backend
+
+      # Check if using native C extension
+      # @rbs () -> bool
+      def native_available?
+        backend == :native
+      end
+
+      # Get the Vector class for the current backend
+      # @rbs () -> Class
+      def vector_class
+        backend == :native ? Classifier::Linalg::Vector : ::Vector
+      end
+
+      # Get the Matrix class for the current backend
+      # @rbs () -> Class
+      def matrix_class
+        backend == :native ? Classifier::Linalg::Matrix : ::Matrix
+      end
+    end
+  end
+end
+
+# Backend detection: native extension > pure Ruby
+# Set NATIVE_VECTOR=true to force pure Ruby implementation
+
 begin
-  raise LoadError if ENV['NATIVE_VECTOR'] == "true" # to test the native vector class, try `rake test NATIVE_VECTOR=true`
+  raise LoadError if ENV['NATIVE_VECTOR'] == 'true'
 
-  require 'gsl' # requires https://github.com/SciRuby/rb-gsl/
-  require 'classifier/extensions/vector_serialize'
-  $GSL = true
-
+  require 'classifier/classifier_ext'
+  Classifier::LSI.backend = :native
 rescue LoadError
-  warn "Notice: for 10x faster LSI support, please install https://github.com/SciRuby/rb-gsl/"
-  $GSL = false
+  # Fall back to pure Ruby implementation
+  unless ENV['SUPPRESS_LSI_WARNING'] == 'true'
+    warn 'Notice: for 5-10x faster LSI, install the classifier gem with native extensions. ' \
+         'Set SUPPRESS_LSI_WARNING=true to hide this.'
+  end
+  Classifier::LSI.backend = :ruby
   require 'classifier/extensions/vector'
 end
 
+require 'json'
+require 'mutex_m'
 require 'classifier/lsi/word_list'
 require 'classifier/lsi/content_node'
 require 'classifier/lsi/summary'
+require 'classifier/lsi/incremental_svd'
 
 module Classifier
-
   # This class implements a Latent Semantic Indexer, which can search, classify and cluster
   # data based on underlying semantic relations. For more information on the algorithms used,
   # please consult Wikipedia[http://en.wikipedia.org/wiki/Latent_Semantic_Indexing].
   class LSI
+    include Mutex_m
+    include Streaming
 
-    attr_reader :word_list
-    attr_accessor :auto_rebuild
+    # @rbs @auto_rebuild: bool
+    # @rbs @word_list: WordList
+    # @rbs @items: Hash[untyped, ContentNode]
+    # @rbs @version: Integer
+    # @rbs @built_at_version: Integer
+    # @rbs @singular_values: Array[Float]?
+    # @rbs @dirty: bool
+    # @rbs @storage: Storage::Base?
+    # @rbs @incremental_mode: bool
+    # @rbs @u_matrix: Matrix?
+    # @rbs @max_rank: Integer
+    # @rbs @initial_vocab_size: Integer?
+    # @rbs @min_word_length: Integer
+
+    attr_reader :word_list, :singular_values
+    attr_accessor :auto_rebuild, :storage
+
+    # Default maximum rank for incremental SVD
+    DEFAULT_MAX_RANK = 100
 
     # Create a fresh index.
     # If you want to call #build_index manually, use
-    #      Classifier::LSI.new :auto_rebuild => false
+    #      Classifier::LSI.new auto_rebuild: false
     #
+    # For incremental SVD mode (adds documents without full rebuild):
+    #      Classifier::LSI.new incremental: true, max_rank: 100
+    #
+    # @rbs (?Hash[Symbol, untyped]) -> void
     def initialize(options = {})
+      super()
       @auto_rebuild = true unless options[:auto_rebuild] == false
-      @word_list, @items = WordList.new, {}
-      @version, @built_at_version = 0, -1
+      @word_list = WordList.new
+      @items = {}
+      @version = 0
+      @built_at_version = -1
+      @dirty = false
+      @storage = nil
+
+      # Incremental SVD settings
+      @incremental_mode = options[:incremental] == true
+      @max_rank = options[:max_rank] || DEFAULT_MAX_RANK
+      @u_matrix = nil
+      @initial_vocab_size = nil
+      @min_word_length = options[:min_word_length] || Classifier.config.min_word_length
     end
 
     # Returns true if the index needs to be rebuilt.  The index needs
     # to be built after all informaton is added, but before you start
     # using it for search, classification and cluster detection.
+    #
+    # @rbs () -> bool
     def needs_rebuild?
-      (@items.keys.size > 1) && (@version != @built_at_version)
+      synchronize { (@items.keys.size > 1) && (@version != @built_at_version) }
+    end
+
+    # @rbs () -> Array[Hash[Symbol, untyped]]?
+    def singular_value_spectrum
+      return nil unless @singular_values
+
+      total = @singular_values.sum
+      return nil if total.zero?
+
+      cumulative = 0.0
+      @singular_values.map.with_index do |value, i|
+        cumulative += value
+        {
+          dimension: i,
+          value: value,
+          percentage: value / total,
+          cumulative_percentage: cumulative / total
+        }
+      end
+    end
+
+    # Returns true if incremental mode is enabled and active.
+    # Incremental mode becomes active after the first build_index call.
+    #
+    # @rbs () -> bool
+    def incremental_enabled?
+      @incremental_mode && !@u_matrix.nil?
+    end
+
+    # Returns the current rank of the incremental SVD (number of singular values kept).
+    # Returns nil if incremental mode is not active.
+    #
+    # @rbs () -> Integer?
+    def current_rank
+      @singular_values&.count(&:positive?)
+    end
+
+    # Disables incremental mode. Subsequent adds will trigger full rebuilds.
+    #
+    # @rbs () -> void
+    def disable_incremental_mode!
+      @incremental_mode = false
+      @u_matrix = nil
+      @initial_vocab_size = nil
+    end
+
+    # Enables incremental mode with optional max_rank setting.
+    # The next build_index call will store the U matrix for incremental updates.
+    #
+    # @rbs (?max_rank: Integer) -> void
+    def enable_incremental_mode!(max_rank: DEFAULT_MAX_RANK)
+      @incremental_mode = true
+      @max_rank = max_rank
+    end
+
+    # Adds items to the index using hash-style syntax.
+    # The hash keys are categories, and values are items (or arrays of items).
+    #
+    # For example:
+    #   lsi = Classifier::LSI.new
+    #   lsi.add("Dog" => "Dogs are loyal pets")
+    #   lsi.add("Cat" => "Cats are independent")
+    #   lsi.add(Bird: "Birds can fly")  # Symbol keys work too
+    #
+    # Multiple items with the same category:
+    #   lsi.add("Dog" => ["Dogs are loyal", "Puppies are cute"])
+    #
+    # Batch operations with multiple categories:
+    #   lsi.add(
+    #     "Dog" => ["Dogs are loyal", "Puppies are cute"],
+    #     "Cat" => ["Cats are independent", "Kittens are playful"]
+    #   )
+    #
+    # @rbs (**untyped items) -> void
+    def add(**items)
+      items.each do |category, value|
+        Array(value).each { |doc| add_item(doc, category.to_s) }
+      end
     end
 
     # Adds an item to the index. item is assumed to be a string, but
@@ -52,6 +207,8 @@ module Classifier
     # fetch fresh string data. This optional block is passed the item,
     # so the item may only be a reference to a URL or file name.
     #
+    # @deprecated Use {#add} instead for clearer hash-style syntax.
+    #
     # For example:
     #   lsi = Classifier::LSI.new
     #   lsi.add_item "This is just plain text"
@@ -59,10 +216,27 @@ module Classifier
     #   ar = ActiveRecordObject.find( :all )
     #   lsi.add_item ar, *ar.categories { |x| ar.content }
     #
-    def add_item( item, *categories, &block )
-      clean_word_hash = block ? block.call(item).clean_word_hash : item.to_s.clean_word_hash
-      @items[item] = ContentNode.new(clean_word_hash, *categories)
-      @version += 1
+    # @rbs (String, *String | Symbol) ?{ (String) -> String } -> void
+    def add_item(item, *categories, &block)
+      clean_word_hash =
+        if block
+          block.call(item).clean_word_hash(@min_word_length)
+        else
+          item.to_s.clean_word_hash(@min_word_length)
+        end
+
+      node = nil
+
+      synchronize do
+        node = ContentNode.new(clean_word_hash, *categories)
+        @items[item] = node
+        @version += 1
+        @dirty = true
+      end
+
+      # Use incremental update if enabled and we have a U matrix
+      return perform_incremental_update(node, clean_word_hash) if @incremental_mode && @u_matrix
+
       build_index if @auto_rebuild
     end
 
@@ -70,36 +244,42 @@ module Classifier
     # you are passing in a string with no categorries. item
     # will be duck typed via to_s .
     #
-    def <<( item )
-      add_item item
+    # @rbs (String) -> void
+    def <<(item)
+      add_item(item)
     end
 
     # Returns the categories for a given indexed items. You are free to add and remove
     # items from this as you see fit. It does not invalide an index to change its categories.
+    #
+    # @rbs (String) -> Array[String | Symbol]
     def categories_for(item)
-      return [] unless @items[item]
-      return @items[item].categories
+      synchronize do
+        return [] unless @items[item]
+
+        @items[item].categories
+      end
     end
 
     # Removes an item from the database, if it is indexed.
     #
-    def remove_item( item )
-      if @items.keys.contain? item
-        @items.remove item
+    # @rbs (String) -> void
+    def remove_item(item)
+      removed = synchronize do
+        next false unless @items.key?(item)
+
+        @items.delete(item)
         @version += 1
+        @dirty = true
+        true
       end
+      build_index if removed && @auto_rebuild
     end
 
     # Returns an array of items that are indexed.
+    # @rbs () -> Array[untyped]
     def items
-      @items.keys
-    end
-
-    # Returns the categories for a given indexed items. You are free to add and remove
-    # items from this as you see fit. It does not invalide an index to change its categories.
-    def categories_for(item)
-      return [] unless @items[item]
-      return @items[item].categories
+      synchronize { @items.keys }
     end
 
     # This function rebuilds the index if needs_rebuild? returns true.
@@ -116,33 +296,39 @@ module Classifier
     # cutoff parameter tells the indexer how many of these values to keep.
     # A value of 1 for cutoff means that no semantic analysis will take place,
     # turning the LSI class into a simple vector search engine.
-    def build_index( cutoff=0.75 )
-      return unless needs_rebuild?
-      make_word_list
+    #
+    # @rbs (?Float, ?force: bool) -> void
+    def build_index(cutoff = 0.75, force: false)
+      validate_cutoff!(cutoff)
 
-      doc_list = @items.values
-      tda = doc_list.collect { |node| node.raw_vector_with( @word_list ) }
+      synchronize do
+        return unless force || needs_rebuild_unlocked?
 
-      if $GSL
-         tdm = GSL::Matrix.alloc(*tda).trans
-         ntdm = build_reduced_matrix(tdm, cutoff)
+        make_word_list
 
-         ntdm.size[1].times do |col|
-           vec = GSL::Vector.alloc( ntdm.column(col) ).row
-           doc_list[col].lsi_vector = vec
-           doc_list[col].lsi_norm = vec.normalize
-         end
-      else
-         tdm = Matrix.rows(tda).trans
-         ntdm = build_reduced_matrix(tdm, cutoff)
+        doc_list = @items.values
+        tda = doc_list.collect { |node| node.raw_vector_with(@word_list) }
 
-         ntdm.row_size.times do |col|
-           doc_list[col].lsi_vector = ntdm.column(col) if doc_list[col]
-           doc_list[col].lsi_norm = ntdm.column(col).normalize  if doc_list[col]
-         end
+        if self.class.native_available?
+          # Convert vectors to arrays for matrix construction
+          tda_arrays = tda.map { |v| v.respond_to?(:to_a) ? v.to_a : v }
+          tdm = self.class.matrix_class.alloc(*tda_arrays).trans
+          ntdm, u_mat = build_reduced_matrix_with_u(tdm, cutoff)
+          assign_native_ext_lsi_vectors(ntdm, doc_list)
+        else
+          tdm = Matrix.rows(tda).trans
+          ntdm, u_mat = build_reduced_matrix_with_u(tdm, cutoff)
+          assign_ruby_lsi_vectors(ntdm, doc_list)
+        end
+
+        # Store U matrix for incremental mode
+        if @incremental_mode
+          @u_matrix = u_mat
+          @initial_vocab_size = @word_list.size
+        end
+
+        @built_at_version = @version
       end
-
-      @built_at_version = @version
     end
 
     # This method returns max_chunks entries, ordered by their average semantic rating.
@@ -153,13 +339,17 @@ module Classifier
     # your dataset's general content. For example, if you were to use categorize on the
     # results of this data, you could gather information on what your dataset is generally
     # about.
-    def highest_relative_content( max_chunks=10 )
-       return [] if needs_rebuild?
+    #
+    # @rbs (?Integer) -> Array[String]
+    def highest_relative_content(max_chunks = 10)
+      synchronize do
+        return [] if needs_rebuild_unlocked?
 
-       avg_density = Hash.new
-       @items.each_key { |x| avg_density[x] = proximity_array_for_content(x).inject(0.0) { |x,y| x + y[1]} }
+        avg_density = {}
+        @items.each_key { |x| avg_density[x] = proximity_array_for_content_unlocked(x).sum { |pair| pair[1] } }
 
-       avg_density.keys.sort_by { |x| avg_density[x] }.reverse[0..max_chunks-1].map
+        avg_density.keys.sort_by { |x| avg_density[x] }.reverse[0..(max_chunks - 1)]
+      end
     end
 
     # This function is the primitive that find_related and classify
@@ -174,20 +364,10 @@ module Classifier
     # The parameter doc is the content to compare. If that content is not
     # indexed, you can pass an optional block to define how to create the
     # text data. See add_item for examples of how this works.
-    def proximity_array_for_content( doc, &block )
-      return [] if needs_rebuild?
-
-      content_node = node_for_content( doc, &block )
-      result =
-        @items.keys.collect do |item|
-          if $GSL
-             val = content_node.search_vector * @items[item].search_vector.col
-          else
-             val = (Matrix[content_node.search_vector] * @items[item].search_vector)[0]
-          end
-          [item, val]
-        end
-      result.sort_by { |x| x[1] }.reverse
+    #
+    # @rbs (String) ?{ (String) -> String } -> Array[[String, Float]]
+    def proximity_array_for_content(doc, &block)
+      synchronize { proximity_array_for_content_unlocked(doc, &block) }
     end
 
     # Similar to proximity_array_for_content, this function takes similar
@@ -195,20 +375,10 @@ module Classifier
     # calculated vectors instead of their full versions. This is useful when
     # you're trying to perform operations on content that is much smaller than
     # the text you're working with. search uses this primitive.
-    def proximity_norms_for_content( doc, &block )
-      return [] if needs_rebuild?
-
-      content_node = node_for_content( doc, &block )
-      result =
-        @items.keys.collect do |item|
-          if $GSL
-            val = content_node.search_norm * @items[item].search_norm.col
-          else
-            val = (Matrix[content_node.search_norm] * @items[item].search_norm)[0]
-          end
-          [item, val]
-        end
-      result.sort_by { |x| x[1] }.reverse
+    #
+    # @rbs (String) ?{ (String) -> String } -> Array[[String, Float]]
+    def proximity_norms_for_content(doc, &block)
+      synchronize { proximity_norms_for_content_unlocked(doc, &block) }
     end
 
     # This function allows for text-based search of your index. Unlike other functions
@@ -218,11 +388,16 @@ module Classifier
     #
     # While this may seem backwards compared to the other functions that LSI supports,
     # it is actually the same algorithm, just applied on a smaller document.
-    def search( string, max_nearest=3 )
-      return [] if needs_rebuild?
-      carry = proximity_norms_for_content( string )
-      result = carry.collect { |x| x[0] }
-      return result[0..max_nearest-1]
+    #
+    # @rbs (String, ?Integer) -> Array[String]
+    def search(string, max_nearest = 3)
+      synchronize do
+        return [] if needs_rebuild_unlocked?
+
+        carry = proximity_norms_for_content_unlocked(string)
+        result = carry.collect { |x| x[0] }
+        result[0..(max_nearest - 1)]
+      end
     end
 
     # This function takes content and finds other documents
@@ -234,11 +409,15 @@ module Classifier
     # This is particularly useful for identifing clusters in your document space.
     # For example you may want to identify several "What's Related" items for weblog
     # articles, or find paragraphs that relate to each other in an essay.
-    def find_related( doc, max_nearest=3, &block )
-      carry =
-        proximity_array_for_content( doc, &block ).reject { |pair| pair[0] == doc }
-      result = carry.collect { |x| x[0] }
-      return result[0..max_nearest-1]
+    #
+    # @rbs (String, ?Integer) ?{ (String) -> String } -> Array[String]
+    def find_related(doc, max_nearest = 3, &block)
+      synchronize do
+        carry =
+          proximity_array_for_content_unlocked(doc, &block).reject { |pair| pair[0] == doc }
+        result = carry.collect { |x| x[0] }
+        result[0..(max_nearest - 1)]
+      end
     end
 
     # This function uses a voting system to categorize documents, based on
@@ -246,14 +425,433 @@ module Classifier
     # find_related function to find related documents, then returns the
     # most obvious category from this list.
     #
-    # cutoff signifies the number of documents to consider when clasifying
-    # text. A cutoff of 1 means that every document in the index votes on
-    # what category the document is in. This may not always make sense.
+    # @rbs (String, ?Float) ?{ (String) -> String } -> String | Symbol
+    def classify(doc, cutoff = 0.30, &block)
+      validate_cutoff!(cutoff)
+
+      synchronize do
+        votes = vote_unlocked(doc, cutoff, &block)
+
+        ranking = votes.keys.sort_by { |x| votes[x] }
+        ranking[-1]
+      end
+    end
+
+    # @rbs (String, ?Float) ?{ (String) -> String } -> Hash[String | Symbol, Float]
+    def vote(doc, cutoff = 0.30, &block)
+      validate_cutoff!(cutoff)
+
+      synchronize { vote_unlocked(doc, cutoff, &block) }
+    end
+
+    # Returns the same category as classify() but also returns
+    # a confidence value derived from the vote share that the
+    # winning category got.
     #
-    def classify( doc, cutoff=0.30, &block )
+    # e.g.
+    # category,confidence = classify_with_confidence(doc)
+    # if confidence < 0.3
+    #   category = nil
+    # end
+    #
+    # See classify() for argument docs
+    # @rbs (String, ?Float) ?{ (String) -> String } -> [String | Symbol | nil, Float?]
+    def classify_with_confidence(doc, cutoff = 0.30, &block)
+      validate_cutoff!(cutoff)
+
+      synchronize do
+        votes = vote_unlocked(doc, cutoff, &block)
+        votes_sum = votes.values.sum
+        return [nil, nil] if votes_sum.zero?
+
+        ranking = votes.keys.sort_by { |x| votes[x] }
+        winner = ranking[-1]
+        vote_share = votes[winner] / votes_sum.to_f
+        [winner, vote_share]
+      end
+    end
+
+    # Prototype, only works on indexed documents.
+    # I have no clue if this is going to work, but in theory
+    # it's supposed to.
+    # @rbs (String, ?Integer) -> Array[Symbol]
+    def highest_ranked_stems(doc, count = 3)
+      synchronize do
+        raise 'Requested stem ranking on non-indexed content!' unless @items[doc]
+
+        arr = node_for_content_unlocked(doc).lsi_vector.to_a
+        top_indices = arr.each_index.sort_by { |index| -arr[index] }.first(count)
+        top_indices.collect { |index| @word_list.word_for_index(index) }
+      end
+    end
+
+    # Custom marshal serialization to exclude mutex state
+    # @rbs () -> Array[untyped]
+    def marshal_dump
+      [@auto_rebuild, @word_list, @items, @version, @built_at_version, @dirty, @min_word_length]
+    end
+
+    # Custom marshal deserialization to recreate mutex
+    # @rbs (Array[untyped]) -> void
+    def marshal_load(data)
+      mu_initialize
+      @auto_rebuild, @word_list, @items, @version, @built_at_version, @dirty,
+        @min_word_length = data
+      @storage = nil
+    end
+
+    # Returns a hash representation of the LSI index.
+    # Only source data (word_hash, categories) is included, not computed vectors.
+    # This can be converted to JSON or used directly.
+    #
+    # @rbs () -> untyped
+    def as_json(*)
+      items_data = @items.transform_values do |node|
+        {
+          word_hash: node.word_hash.transform_keys(&:to_s),
+          categories: node.categories.map(&:to_s)
+        }
+      end
+
+      {
+        version: 1,
+        type: 'lsi',
+        auto_rebuild: @auto_rebuild,
+        items: items_data
+      }
+    end
+
+    # Serializes the LSI index to a JSON string.
+    # Only source data (word_hash, categories) is serialized, not computed vectors.
+    # On load, the index will be rebuilt automatically.
+    #
+    # @rbs () -> String
+    def to_json(*)
+      as_json.to_json
+    end
+
+    # Loads an LSI index from a JSON string or Hash created by #to_json or #as_json.
+    # The index will be rebuilt after loading.
+    #
+    # @rbs (String | Hash[String, untyped]) -> LSI
+    def self.from_json(json)
+      data = json.is_a?(String) ? JSON.parse(json) : json
+      raise ArgumentError, "Invalid classifier type: #{data['type']}" unless data['type'] == 'lsi'
+
+      # Create instance with auto_rebuild disabled during loading
+      instance = new(auto_rebuild: false)
+
+      # Restore items (categories stay as strings, matching original storage)
+      data['items'].each do |item_key, item_data|
+        word_hash = item_data['word_hash'].transform_keys(&:to_sym)
+        categories = item_data['categories']
+        instance.instance_variable_get(:@items)[item_key] = ContentNode.new(word_hash, *categories)
+        instance.instance_variable_set(:@version, instance.instance_variable_get(:@version) + 1)
+      end
+
+      # Restore auto_rebuild setting and rebuild index
+      instance.auto_rebuild = data['auto_rebuild']
+      instance.build_index
+      instance
+    end
+
+    # Saves the LSI index to the configured storage.
+    # Raises ArgumentError if no storage is configured.
+    #
+    # @rbs () -> void
+    def save
+      raise ArgumentError, 'No storage configured. Use save_to_file(path) or set storage=' unless storage
+
+      storage.write(to_json)
+      @dirty = false
+    end
+
+    # Saves the LSI index to a file (legacy API).
+    #
+    # @rbs (String) -> Integer
+    def save_to_file(path)
+      result = File.write(path, to_json)
+      @dirty = false
+      result
+    end
+
+    # Reloads the LSI index from the configured storage.
+    # Raises UnsavedChangesError if there are unsaved changes.
+    # Use reload! to force reload and discard changes.
+    #
+    # @rbs () -> self
+    def reload
+      raise ArgumentError, 'No storage configured' unless storage
+      raise UnsavedChangesError, 'Unsaved changes would be lost. Call save first or use reload!' if @dirty
+
+      data = storage.read
+      raise StorageError, 'No saved state found' unless data
+
+      restore_from_json(data)
+      @dirty = false
+      self
+    end
+
+    # Force reloads the LSI index from storage, discarding any unsaved changes.
+    #
+    # @rbs () -> self
+    def reload!
+      raise ArgumentError, 'No storage configured' unless storage
+
+      data = storage.read
+      raise StorageError, 'No saved state found' unless data
+
+      restore_from_json(data)
+      @dirty = false
+      self
+    end
+
+    # Returns true if there are unsaved changes.
+    #
+    # @rbs () -> bool
+    def dirty?
+      @dirty
+    end
+
+    # Loads an LSI index from the configured storage.
+    # The storage is set on the returned instance.
+    #
+    # @rbs (storage: Storage::Base) -> LSI
+    def self.load(storage:)
+      data = storage.read
+      raise StorageError, 'No saved state found' unless data
+
+      instance = from_json(data)
+      instance.storage = storage
+      instance
+    end
+
+    # Loads an LSI index from a file (legacy API).
+    #
+    # @rbs (String) -> LSI
+    def self.load_from_file(path)
+      from_json(File.read(path))
+    end
+
+    # Loads an LSI index from a checkpoint.
+    #
+    # @rbs (storage: Storage::Base, checkpoint_id: String) -> LSI
+    def self.load_checkpoint(storage:, checkpoint_id:)
+      raise ArgumentError, 'Storage must be File storage for checkpoints' unless storage.is_a?(Storage::File)
+
+      dir = File.dirname(storage.path)
+      base = File.basename(storage.path, '.*')
+      ext = File.extname(storage.path)
+      checkpoint_path = File.join(dir, "#{base}_checkpoint_#{checkpoint_id}#{ext}")
+
+      checkpoint_storage = Storage::File.new(path: checkpoint_path)
+      instance = load(storage: checkpoint_storage)
+      instance.storage = storage
+      instance
+    end
+
+    # Trains the LSI index from an IO stream.
+    # Each line in the stream is treated as a separate document.
+    # Documents are added without rebuilding, then the index is rebuilt at the end.
+    #
+    # @example Train from a file
+    #   lsi.train_from_stream(:category, File.open('corpus.txt'))
+    #
+    # @example With progress tracking
+    #   lsi.train_from_stream(:category, io, batch_size: 500) do |progress|
+    #     puts "#{progress.completed} documents processed"
+    #   end
+    #
+    # rubocop:disable Metrics/CyclomaticComplexity, Metrics/PerceivedComplexity
+    # @rbs (?(String | Symbol | nil), ?IO?, ?batch_size: Integer, **IO) { (Streaming::Progress) -> void } -> void
+    def train_from_stream(category = nil, io = nil, batch_size: Streaming::DEFAULT_BATCH_SIZE, **categories, &)
+      # rubocop:enable Metrics/CyclomaticComplexity, Metrics/PerceivedComplexity
+      raise ArgumentError, 'Provide either (category, io) or keyword category: io pairs' if category.nil? && io.nil? && categories.empty?
+      raise ArgumentError, 'Provide both category and io, or use keyword arguments' if [category, io].one?(&:nil?)
+
+      pairs = category && io ? { category => io } : categories
+      pairs.each_value do |io|
+        raise ArgumentError, 'Stream must respond to #each_line' unless io.respond_to?(:each_line)
+      end
+      begin
+        original_auto_rebuild = @auto_rebuild
+        @auto_rebuild = false
+        pairs.each do |cat, stream|
+          stream_train_category(cat, stream, batch_size:, &)
+        end
+      ensure
+        @auto_rebuild = original_auto_rebuild
+        build_index if original_auto_rebuild
+      end
+    end
+
+    # Adds items to the index in batches from an array.
+    # Documents are added without rebuilding, then the index is rebuilt at the end.
+    #
+    # @example Batch add with progress
+    #   lsi.add_batch(Dog: documents, batch_size: 100) do |progress|
+    #     puts "#{progress.percent}% complete"
+    #   end
+    #
+    # @rbs (?batch_size: Integer, **Array[String]) { (Streaming::Progress) -> void } -> void
+    def add_batch(batch_size: Streaming::DEFAULT_BATCH_SIZE, **items)
+      original_auto_rebuild = @auto_rebuild
+      @auto_rebuild = false
+
+      begin
+        total_docs = items.values.sum { |v| Array(v).size }
+        progress = Streaming::Progress.new(total: total_docs)
+
+        items.each do |category, documents|
+          Array(documents).each_slice(batch_size) do |batch|
+            batch.each { |doc| add_item(doc, category.to_s) }
+            progress.completed += batch.size
+            progress.current_batch += 1
+            yield progress if block_given?
+          end
+        end
+      ensure
+        @auto_rebuild = original_auto_rebuild
+        build_index if original_auto_rebuild
+      end
+    end
+
+    # Alias train_batch to add_batch for API consistency with other classifiers.
+    # Note: LSI uses categories differently (items have categories, not the training call).
+    #
+    # @rbs (?(String | Symbol)?, ?Array[String]?, ?batch_size: Integer, **Array[String]) { (Streaming::Progress) -> void } -> void
+    def train_batch(category = nil, documents = nil, batch_size: Streaming::DEFAULT_BATCH_SIZE, **categories, &block)
+      if category && documents
+        add_batch(batch_size: batch_size, **{ category.to_sym => documents }, &block)
+      else
+        add_batch(batch_size: batch_size, **categories, &block)
+      end
+    end
+
+    private
+
+    # Trains from an IO stream with a single category.
+    # @rbs (String | Symbol, IO, batch_size: Integer) { (Streaming::Progress) -> void } -> void
+    def stream_train_category(category, io, batch_size:)
+      reader = Streaming::LineReader.new(io, batch_size: batch_size)
+      total = reader.estimate_line_count
+      progress = Streaming::Progress.new(total: total)
+
+      reader.each_batch do |batch|
+        batch.each { |text| add_item(text, category) }
+        progress.completed += batch.size
+        progress.current_batch += 1
+        yield progress if block_given?
+      end
+    end
+
+    # Restores LSI state from a JSON string (used by reload)
+    # @rbs (String) -> void
+    def restore_from_json(json)
+      data = JSON.parse(json)
+      raise ArgumentError, "Invalid classifier type: #{data['type']}" unless data['type'] == 'lsi'
+
+      synchronize do
+        # Recreate the items
+        @items = {}
+        data['items'].each do |item_key, item_data|
+          word_hash = item_data['word_hash'].transform_keys(&:to_sym)
+          categories = item_data['categories']
+          @items[item_key] = ContentNode.new(word_hash, *categories)
+        end
+
+        # Restore settings
+        @auto_rebuild = data['auto_rebuild']
+        @version += 1
+        @built_at_version = -1
+        @word_list = WordList.new
+        @dirty = false
+      end
+
+      # Rebuild the index
+      build_index
+    end
+
+    # @rbs (Float) -> void
+    def validate_cutoff!(cutoff)
+      return if cutoff.positive? && cutoff < 1
+
+      raise ArgumentError, "cutoff must be between 0 and 1 (exclusive), got #{cutoff}"
+    end
+
+    # Assigns LSI vectors using native C extension
+    # @rbs (untyped, Array[ContentNode]) -> void
+    def assign_native_ext_lsi_vectors(ntdm, doc_list)
+      ntdm.size[1].times do |col|
+        vec = self.class.vector_class.alloc(ntdm.column(col).to_a).row
+        doc_list[col].lsi_vector = vec
+        doc_list[col].lsi_norm = vec.normalize
+      end
+    end
+
+    # Assigns LSI vectors using pure Ruby Matrix
+    # @rbs (untyped, Array[ContentNode]) -> void
+    def assign_ruby_lsi_vectors(ntdm, doc_list)
+      ntdm.column_size.times do |col|
+        next unless doc_list[col]
+
+        column = ntdm.column(col)
+        next unless column
+
+        doc_list[col].lsi_vector = column
+        doc_list[col].lsi_norm = column.normalize
+      end
+    end
+
+    # Unlocked version of needs_rebuild? for internal use when lock is already held
+    # @rbs () -> bool
+    def needs_rebuild_unlocked?
+      (@items.keys.size > 1) && (@version != @built_at_version)
+    end
+
+    # Unlocked version of proximity_array_for_content for internal use
+    # @rbs (String) ?{ (String) -> String } -> Array[[String, Float]]
+    def proximity_array_for_content_unlocked(doc, &)
+      return [] if needs_rebuild_unlocked?
+      return @items.keys.map { |item| [item, 1.0] } if @items.size == 1
+
+      content_node = node_for_content_unlocked(doc, &)
+      result =
+        @items.keys.collect do |item|
+          val = if self.class.native_available?
+                  content_node.search_vector * @items[item].search_vector.col
+                else
+                  (Matrix[content_node.search_vector] * @items[item].search_vector)[0]
+                end
+          [item, val]
+        end
+      result.sort_by { |x| x[1] }.reverse
+    end
+
+    # Unlocked version of proximity_norms_for_content for internal use
+    # @rbs (String) ?{ (String) -> String } -> Array[[String, Float]]
+    def proximity_norms_for_content_unlocked(doc, &)
+      return [] if needs_rebuild_unlocked?
+
+      content_node = node_for_content_unlocked(doc, &)
+      result =
+        @items.keys.collect do |item|
+          val = if self.class.native_available?
+                  content_node.search_norm * @items[item].search_norm.col
+                else
+                  (Matrix[content_node.search_norm] * @items[item].search_norm)[0]
+                end
+          [item, val]
+        end
+      result.sort_by { |x| x[1] }.reverse
+    end
+
+    # Unlocked version of vote for internal use
+    # @rbs (String, ?Float) ?{ (String) -> String } -> Hash[String | Symbol, Float]
+    def vote_unlocked(doc, cutoff = 0.30, &)
       icutoff = (@items.size * cutoff).round
-      carry = proximity_array_for_content( doc, &block )
-      carry = carry[0..icutoff-1]
+      carry = proximity_array_for_content_unlocked(doc, &)
+      carry = carry[0..(icutoff - 1)]
       votes = {}
       carry.each do |pair|
         categories = @items[pair[0]].categories
@@ -262,51 +860,80 @@ module Classifier
           votes[category] += pair[1]
         end
       end
-
-      ranking = votes.keys.sort_by { |x| votes[x] }
-      return ranking[-1]
+      votes
     end
 
-    # Prototype, only works on indexed documents.
-    # I have no clue if this is going to work, but in theory
-    # it's supposed to.
-    def highest_ranked_stems( doc, count=3 )
-      raise "Requested stem ranking on non-indexed content!" unless @items[doc]
-      arr = node_for_content(doc).lsi_vector.to_a
-      top_n = arr.sort.reverse[0..count-1]
-      return top_n.collect { |x| @word_list.word_for_index(arr.index(x))}
+    # Unlocked version of node_for_content for internal use.
+    # @rbs (String) ?{ (String) -> String } -> ContentNode
+    def node_for_content_unlocked(item, &block)
+      return @items[item] if @items[item]
+
+      clean_word_hash = block ? block.call(item).clean_word_hash : item.to_s.clean_word_hash
+      cn = ContentNode.new(clean_word_hash, &block)
+      cn.raw_vector_with(@word_list) unless needs_rebuild_unlocked?
+      assign_lsi_vector_incremental(cn) if incremental_enabled?
+      cn
     end
 
-    private
-    def build_reduced_matrix( matrix, cutoff=0.75 )
-      # TODO: Check that M>=N on these dimensions! Transpose helps assure this
+    # @rbs (untyped, ?Float) -> untyped
+    def build_reduced_matrix(matrix, cutoff = 0.75)
+      result, _u = build_reduced_matrix_with_u(matrix, cutoff)
+      result
+    end
+
+    # Builds reduced matrix and returns both the result and the U matrix.
+    # U matrix is needed for incremental SVD updates.
+    # @rbs (untyped, ?Float) -> [untyped, Matrix]
+    def build_reduced_matrix_with_u(matrix, cutoff = 0.75)
       u, v, s = matrix.SV_decomp
 
-      # TODO: Better than 75% term, please. :\
-      s_cutoff = s.sort.reverse[(s.size * cutoff).round - 1]
+      all_singular_values = s.sort.reverse
+      s_cutoff_index = [(s.size * cutoff).round - 1, 0].max
+      s_cutoff = all_singular_values[s_cutoff_index]
+
+      kept_indices = []
+      kept_singular_values = []
       s.size.times do |ord|
-        s[ord] = 0.0 if s[ord] < s_cutoff
-      end
-      # Reconstruct the term document matrix, only with reduced rank
-      u * ($GSL ? GSL::Matrix : ::Matrix).diag( s ) * v.trans
-    end
-
-    def node_for_content(item, &block)
-      if @items[item]
-        return @items[item]
-      else
-        clean_word_hash = block ? block.call(item).clean_word_hash : item.to_s.clean_word_hash
-
-        cn = ContentNode.new(clean_word_hash, &block) # make the node and extract the data
-
-        unless needs_rebuild?
-          cn.raw_vector_with( @word_list ) # make the lsi raw and norm vectors
+        if s[ord] >= s_cutoff
+          kept_indices << ord
+          kept_singular_values << s[ord]
+        else
+          s[ord] = 0.0
         end
       end
 
-      return cn
+      @singular_values = kept_singular_values.sort.reverse
+      result = u * self.class.matrix_class.diag(s) * v.trans
+      result = result.trans if result.row_size != matrix.row_size
+      u_reduced = extract_reduced_u(u, kept_indices, s)
+
+      [result, u_reduced]
     end
 
+    # Extracts columns from U corresponding to kept singular values.
+    # Columns are sorted by descending singular value to match @singular_values order.
+    # rubocop:disable Naming/MethodParameterName
+    # @rbs (untyped, Array[Integer], Array[Float]) -> Matrix
+    def extract_reduced_u(u, kept_indices, singular_values)
+      return Matrix.empty(u.row_size, 0) if kept_indices.empty?
+
+      sorted_indices = kept_indices.sort_by { |i| -singular_values[i] }
+
+      if u.respond_to?(:to_ruby_matrix)
+        u = u.to_ruby_matrix
+      elsif !u.is_a?(::Matrix)
+        rows = u.row_size.times.map do |i|
+          sorted_indices.map { |j| u[i, j] }
+        end
+        return Matrix.rows(rows)
+      end
+
+      cols = sorted_indices.map { |i| u.column(i).to_a }
+      Matrix.columns(cols)
+    end
+    # rubocop:enable Naming/MethodParameterName
+
+    # @rbs () -> void
     def make_word_list
       @word_list = WordList.new
       @items.each_value do |node|
@@ -314,6 +941,128 @@ module Classifier
       end
     end
 
+    # Performs incremental SVD update for a new document.
+    # @rbs (ContentNode, Hash[Symbol, Integer]) -> void
+    def perform_incremental_update(node, word_hash)
+      needs_full_rebuild = false
+      old_rank = nil
+
+      synchronize do
+        if vocabulary_growth_exceeds_threshold?(word_hash)
+          disable_incremental_mode!
+          needs_full_rebuild = true
+          next
+        end
+
+        old_rank = @u_matrix.column_size
+        extend_vocabulary_for_incremental(word_hash)
+        raw_vec = node.raw_vector_with(@word_list)
+        raw_vector = Vector[*raw_vec.to_a]
+
+        @u_matrix, @singular_values = IncrementalSVD.update(
+          @u_matrix, @singular_values, raw_vector, max_rank: @max_rank
+        )
+
+        new_rank = @u_matrix.column_size
+        if new_rank > old_rank
+          reproject_all_documents
+        else
+          assign_lsi_vector_incremental(node)
+        end
+
+        @built_at_version = @version
+      end
+
+      build_index if needs_full_rebuild
+    end
+
+    # Checks if vocabulary growth would exceed threshold (20%)
+    # @rbs (Hash[Symbol, Integer]) -> bool
+    def vocabulary_growth_exceeds_threshold?(word_hash)
+      return false unless @initial_vocab_size&.positive?
+
+      new_words = word_hash.keys.count { |w| @word_list[w].nil? }
+      growth_ratio = new_words.to_f / @initial_vocab_size
+      growth_ratio > 0.2
+    end
+
+    # Extends vocabulary and U matrix for new words.
+    # @rbs (Hash[Symbol, Integer]) -> void
+    def extend_vocabulary_for_incremental(word_hash)
+      new_words = word_hash.keys.select { |w| @word_list[w].nil? }
+      return if new_words.empty?
+
+      new_words.each { |word| @word_list.add_word(word) }
+      extend_u_matrix(new_words.size)
+    end
+
+    # Extends U matrix with zero rows for new vocabulary terms.
+    # @rbs (Integer) -> void
+    def extend_u_matrix(num_new_rows)
+      return if num_new_rows.zero? || @u_matrix.nil?
+
+      if self.class.native_available? && @u_matrix.is_a?(self.class.matrix_class)
+        new_rows = self.class.matrix_class.zeros(num_new_rows, @u_matrix.column_size)
+        @u_matrix = self.class.matrix_class.vstack(@u_matrix, new_rows)
+      else
+        new_rows = Matrix.zero(num_new_rows, @u_matrix.column_size)
+        @u_matrix = Matrix.vstack(@u_matrix, new_rows)
+      end
+    end
+
+    # Re-projects all documents onto the current U matrix
+    # Called when rank grows to ensure consistent LSI vector sizes
+    # Uses native batch_project for performance when available
+    # @rbs () -> void
+    def reproject_all_documents
+      return unless @u_matrix
+      return reproject_all_documents_native if self.class.native_available? && @u_matrix.respond_to?(:batch_project)
+
+      reproject_all_documents_ruby
+    end
+
+    # Native batch re-projection using C extension.
+    # @rbs () -> void
+    def reproject_all_documents_native
+      nodes = @items.values
+      raw_vectors = nodes.map do |node|
+        raw = node.raw_vector_with(@word_list)
+        raw.is_a?(self.class.vector_class) ? raw : self.class.vector_class.alloc(raw.to_a)
+      end
+
+      lsi_vectors = @u_matrix.batch_project(raw_vectors)
+
+      nodes.each_with_index do |node, i|
+        lsi_vec = lsi_vectors[i].row
+        node.lsi_vector = lsi_vec
+        node.lsi_norm = lsi_vec.normalize
+      end
+    end
+
+    # Pure Ruby re-projection (fallback)
+    # @rbs () -> void
+    def reproject_all_documents_ruby
+      @items.each_value do |node|
+        assign_lsi_vector_incremental(node)
+      end
+    end
+
+    # Assigns LSI vector to a node using projection: lsi_vec = U^T * raw_vec.
+    # @rbs (ContentNode) -> void
+    def assign_lsi_vector_incremental(node)
+      return unless @u_matrix
+
+      raw_vec = node.raw_vector_with(@word_list)
+      raw_vector = Vector[*raw_vec.to_a]
+      lsi_arr = (@u_matrix.transpose * raw_vector).to_a
+
+      lsi_vec = if self.class.native_available?
+                  self.class.vector_class.alloc(lsi_arr).row
+                else
+                  Vector[*lsi_arr]
+                end
+      node.lsi_vector = lsi_vec
+      node.lsi_norm = lsi_vec.normalize
+    end
   end
 end
-
